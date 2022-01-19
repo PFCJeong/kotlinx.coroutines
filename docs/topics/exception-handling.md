@@ -15,13 +15,20 @@ When these builders are used to create a _root_ coroutine, that is not a _child_
 the former builders treat exceptions as **uncaught** exceptions, similar to Java's `Thread.uncaughtExceptionHandler`,
 while the latter are relying on the user to consume the final
 exception, for example via [await][Deferred.await] or [receive][ReceiveChannel.receive] 
-([produce] and [receive][ReceiveChannel.receive] are covered later in [Channels](https://github.com/Kotlin/kotlinx.coroutines/blob/master/docs/channels.md) section).
+([produce] and [receive][ReceiveChannel.receive] are covered in [Channels](https://github.com/Kotlin/kotlinx.coroutines/blob/master/docs/channels.md) section).
 
 It can be demonstrated by a simple example that creates root coroutines using the [GlobalScope]:
+
+> [GlobalScope] is a delicate API that can backfire in non-trivial ways. Creating a root coroutine for the
+> whole application is one of the rare legitimate uses for `GlobalScope`, so you must explicitly opt-in into 
+> using `GlobalScope` with `@OptIn(DelicateCoroutinesApi::class)`.
+>
+{type="note"}
 
 ```kotlin
 import kotlinx.coroutines.*
 
+@OptIn(DelicateCoroutinesApi::class)
 fun main() = runBlocking {
     val job = GlobalScope.launch { // root coroutine with launch
         println("Throwing exception from launch")
@@ -61,7 +68,7 @@ Caught ArithmeticException
 ## CoroutineExceptionHandler
 
 It is possible to customize the default behavior of printing **uncaught** exceptions to the console.
-[CoroutineExceptionHandler] context element on a _root_ coroutine can be used as generic `catch` block for
+[CoroutineExceptionHandler] context element on a _root_ coroutine can be used as a generic `catch` block for
 this root coroutine and all its children where custom exception handling may take place.
 It is similar to [`Thread.uncaughtExceptionHandler`](https://docs.oracle.com/javase/8/docs/api/java/lang/Thread.html#setUncaughtExceptionHandler(java.lang.Thread.UncaughtExceptionHandler)).
 You cannot recover from the exception in the `CoroutineExceptionHandler`. The coroutine had already completed
@@ -90,6 +97,7 @@ so its `CoroutineExceptionHandler` has no effect either.
 ```kotlin
 import kotlinx.coroutines.*
 
+@OptIn(DelicateCoroutinesApi::class)
 fun main() = runBlocking {
 //sampleStart
     val handler = CoroutineExceptionHandler { _, exception -> 
@@ -184,6 +192,7 @@ which is demonstrated by the following example.
 ```kotlin
 import kotlinx.coroutines.*
 
+@OptIn(DelicateCoroutinesApi::class)
 fun main() = runBlocking {
 //sampleStart
     val handler = CoroutineExceptionHandler { _, exception -> 
@@ -242,6 +251,7 @@ import kotlinx.coroutines.exceptions.*
 import kotlinx.coroutines.*
 import java.io.*
 
+@OptIn(DelicateCoroutinesApi::class)
 fun main() = runBlocking {
     val handler = CoroutineExceptionHandler { _, exception ->
         println("CoroutineExceptionHandler got $exception with suppressed ${exception.suppressed.contentToString()}")
@@ -292,6 +302,7 @@ Cancellation exceptions are transparent and are unwrapped by default:
 import kotlinx.coroutines.*
 import java.io.*
 
+@OptIn(DelicateCoroutinesApi::class)
 fun main() = runBlocking {
 //sampleStart
     val handler = CoroutineExceptionHandler { _, exception ->
@@ -338,7 +349,7 @@ hierarchy of coroutines. Let us take a look at the case when unidirectional canc
 
 A good example of such a requirement is a UI component with the job defined in its scope. If any of the UI's child tasks
 have failed, it is not always necessary to cancel (effectively kill) the whole UI component,
-but if UI component is destroyed (and its job is cancelled), then it is necessary to fail all child jobs as their results are no longer needed.
+but if the UI component is destroyed (and its job is cancelled), then it is necessary to cancel all child jobs as their results are no longer needed.
 
 Another example is a server process that spawns multiple child jobs and needs to _supervise_
 their execution, tracking their failures and only restarting the failed ones.
@@ -353,6 +364,7 @@ only downwards. This can easily be demonstrated using the following example:
 import kotlinx.coroutines.*
 
 fun main() = runBlocking {
+//sampleStart
     val supervisor = SupervisorJob()
     with(CoroutineScope(coroutineContext + supervisor)) {
         // launch the first child -- its exception is ignored for this example (don't do this in practice!)
@@ -378,8 +390,10 @@ fun main() = runBlocking {
         supervisor.cancel()
         secondChild.join()
     }
+//sampleEnd
 }
 ```
+{kotlin-runnable="true" kotlin-min-compiler-version="1.3"}
 
 > You can get the full code [here](../../kotlinx-coroutines-core/jvm/test/guide/example-supervision-01.kt).
 >
@@ -407,6 +421,7 @@ import kotlin.coroutines.*
 import kotlinx.coroutines.*
 
 fun main() = runBlocking {
+//sampleStart
     try {
         supervisorScope {
             val child = launch {
@@ -425,8 +440,10 @@ fun main() = runBlocking {
     } catch(e: AssertionError) {
         println("Caught an assertion error")
     }
+//sampleEnd
 }
 ```
+{kotlin-runnable="true" kotlin-min-compiler-version="1.3"}
 
 > You can get the full code [here](../../kotlinx-coroutines-core/jvm/test/guide/example-supervision-02.kt).
 >
@@ -457,6 +474,7 @@ import kotlin.coroutines.*
 import kotlinx.coroutines.*
 
 fun main() = runBlocking {
+//sampleStart
     val handler = CoroutineExceptionHandler { _, exception -> 
         println("CoroutineExceptionHandler got $exception") 
     }
@@ -468,8 +486,10 @@ fun main() = runBlocking {
         println("The scope is completing")
     }
     println("The scope is completed")
+//sampleEnd
 }
 ```
+{kotlin-runnable="true" kotlin-min-compiler-version="1.3"}
 
 > You can get the full code [here](../../kotlinx-coroutines-core/jvm/test/guide/example-supervision-03.kt).
 >
@@ -497,7 +517,7 @@ The scope is completed
 [CoroutineExceptionHandler]: https://kotlin.github.io/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-coroutine-exception-handler/index.html
 [Job]: https://kotlin.github.io/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-job/index.html
 [Deferred]: https://kotlin.github.io/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-deferred/index.html
-[Job.cancel]: https://kotlin.github.io/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-job/cancel.html
+[Job.cancel]: https://kotlin.github.io/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/cancel.html
 [runBlocking]: https://kotlin.github.io/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/run-blocking.html
 [SupervisorJob()]: https://kotlin.github.io/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-supervisor-job.html
 [Job()]: https://kotlin.github.io/kotlinx.coroutines/kotlinx-coroutines-core/kotlinx.coroutines/-job.html

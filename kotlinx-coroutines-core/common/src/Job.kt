@@ -115,12 +115,9 @@ public interface Job : CoroutineContext.Element {
      */
     public companion object Key : CoroutineContext.Key<Job> {
         init {
-            /*
-             * Here we make sure that CoroutineExceptionHandler is always initialized in advance, so
-             * that if a coroutine fails due to StackOverflowError we don't fail to report this error
-             * trying to initialize CoroutineExceptionHandler
-             */
-            CoroutineExceptionHandler
+            // `Job` will necessarily be accessed early, so this is as good a place as any for the
+            // initialization logic that we want to happen as soon as possible
+            initializeDefaultExceptionHandlers()
         }
     }
 
@@ -177,7 +174,7 @@ public interface Job : CoroutineContext.Element {
 
     /**
      * Starts coroutine related to this job (if any) if it was not started yet.
-     * The result `true` if this invocation actually started coroutine or `false`
+     * The result is `true` if this invocation actually started coroutine or `false`
      * if it was already started or completed.
      */
     public fun start(): Boolean
@@ -261,9 +258,9 @@ public interface Job : CoroutineContext.Element {
      * suspending function is invoked or while it is suspended, this function
      * throws [CancellationException].
      *
-     * In particular, it means that a parent coroutine invoking `join` on a child coroutine that was started using
-     * `launch(coroutineContext) { ... }` builder throws [CancellationException] if the child
-     * had crashed, unless a non-standard [CoroutineExceptionHandler] is installed in the context.
+     * In particular, it means that a parent coroutine invoking `join` on a child coroutine throws
+     * [CancellationException] if the child had failed, since a failure of a child coroutine cancels parent by default,
+     * unless the child was launched from within [supervisorScope].
      *
      * This function can be used in [select] invocation with [onJoin] clause.
      * Use [isCompleted] to check for a completion of this job without waiting.
@@ -396,25 +393,13 @@ public fun Job0(parent: Job? = null): Job = Job(parent)
 /**
  * A handle to an allocated object that can be disposed to make it eligible for garbage collection.
  */
-public interface DisposableHandle {
+public fun interface DisposableHandle {
     /**
      * Disposes the corresponding object, making it eligible for garbage collection.
      * Repeated invocation of this function has no effect.
      */
     public fun dispose()
 }
-
-/**
- * @suppress **This an internal API and should not be used from general code.**
- */
-@Suppress("FunctionName")
-@InternalCoroutinesApi
-public inline fun DisposableHandle(crossinline block: () -> Unit): DisposableHandle =
-    object : DisposableHandle {
-        override fun dispose() {
-            block()
-        }
-    }
 
 // -------------------- Parent-child communication --------------------
 
@@ -466,6 +451,14 @@ public interface ParentJob : Job {
 @InternalCoroutinesApi
 @Deprecated(level = DeprecationLevel.ERROR, message = "This is internal API and may be removed in the future releases")
 public interface ChildHandle : DisposableHandle {
+
+    /**
+     * Returns the parent of the current parent-child relationship.
+     * @suppress **This is unstable API and it is subject to change.**
+     */
+    @InternalCoroutinesApi
+    public val parent: Job?
+
     /**
      * Child is cancelling its parent by invoking this method.
      * This method is invoked by the child twice. The first time child report its root cause as soon as possible,
@@ -499,9 +492,9 @@ internal fun Job.disposeOnCompletion(handle: DisposableHandle): DisposableHandle
  * suspending function is invoked or while it is suspended, this function
  * throws [CancellationException].
  *
- * In particular, it means that a parent coroutine invoking `cancelAndJoin` on a child coroutine that was started using
- * `launch(coroutineContext) { ... }` builder throws [CancellationException] if the child
- * had crashed, unless a non-standard [CoroutineExceptionHandler] is installed in the context.
+ * In particular, it means that a parent coroutine invoking `cancelAndJoin` on a child coroutine throws
+ * [CancellationException] if the child had failed, since a failure of a child coroutine cancels parent by default,
+ * unless the child was launched from within [supervisorScope].
  *
  * This is a shortcut for the invocation of [cancel][Job.cancel] followed by [join][Job.join].
  */
@@ -659,6 +652,9 @@ private fun Throwable?.orCancellation(job: Job): Throwable = this ?: JobCancella
  */
 @InternalCoroutinesApi
 public object NonDisposableHandle : DisposableHandle, ChildHandle {
+
+    override val parent: Job? get() = null
+
     /**
      * Does not do anything.
      * @suppress

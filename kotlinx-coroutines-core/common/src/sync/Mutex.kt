@@ -10,7 +10,6 @@ import kotlinx.coroutines.internal.*
 import kotlinx.coroutines.intrinsics.*
 import kotlinx.coroutines.selects.*
 import kotlin.contracts.*
-import kotlin.coroutines.*
 import kotlin.jvm.*
 import kotlin.native.concurrent.*
 
@@ -53,8 +52,7 @@ public interface Mutex {
      * Note that this function does not check for cancellation when it is not suspended.
      * Use [yield] or [CoroutineScope.isActive] to periodically check for cancellation in tight loops if needed.
      *
-     * This function can be used in [select] invocation with [onLock] clause.
-     * Use [tryLock] to try acquire lock without waiting.
+     * Use [tryLock] to try acquiring a lock without waiting.
      *
      * This function is fair; suspended callers are resumed in first-in-first-out order.
      *
@@ -64,10 +62,10 @@ public interface Mutex {
     public suspend fun lock(owner: Any? = null)
 
     /**
-     * Clause for [select] expression of [lock] suspending function that selects when the mutex is locked.
-     * Additional parameter for the clause in the `owner` (see [lock]) and when the clause is selected
-     * the reference to this mutex is passed into the corresponding block.
+     * Deprecated for removal without built-in replacement.
      */
+    @Deprecated(level = DeprecationLevel.WARNING, message = "Mutex.onLock deprecated without replacement. " +
+        "For additional details please refer to #2794") // WARNING since 1.6.0
     public val onLock: SelectClause2<Any?, Mutex>
 
     /**
@@ -123,8 +121,6 @@ public suspend inline fun <T> Mutex.withLock(owner: Any? = null, action: () -> T
 private val LOCK_FAIL = Symbol("LOCK_FAIL")
 @SharedImmutable
 private val UNLOCK_FAIL = Symbol("UNLOCK_FAIL")
-@SharedImmutable
-private val SELECT_SUCCESS = Symbol("SELECT_SUCCESS")
 @SharedImmutable
 private val LOCKED = Symbol("LOCKED")
 @SharedImmutable
@@ -191,7 +187,7 @@ internal class MutexImpl(locked: Boolean) : Mutex, SelectClause2<Any?, Mutex> {
     }
 
     private suspend fun lockSuspend(owner: Any?) = suspendCancellableCoroutineReusable<Unit> sc@ { cont ->
-        val waiter = LockCont(owner, cont)
+        var waiter = LockCont(owner, cont)
         _state.loop { state ->
             when (state) {
                 is Empty -> {
@@ -210,11 +206,24 @@ internal class MutexImpl(locked: Boolean) : Mutex, SelectClause2<Any?, Mutex> {
                 is LockedQueue -> {
                     val curOwner = state.owner
                     check(curOwner !== owner) { "Already locked by $owner" }
-                    if (state.addLastIf(waiter) { _state.value === state }) {
-                        // added to waiter list!
+
+                    state.addLast(waiter)
+                    /*
+                     * If the state has been changed while we were adding the waiter,
+                     * it means that 'unlock' has taken it and _either_ resumed it successfully or just overwritten.
+                     * To rendezvous that, we try to "invalidate" our node and go for retry.
+                     *
+                     * Node has to be re-instantiated as we do not support node re-adding, even to
+                     * another list
+                     */
+                    if (_state.value === state || !waiter.take()) {
+                        // added to waiter list
                         cont.removeOnCancellation(waiter)
                         return@sc
                     }
+
+                    waiter = LockCont(owner, cont)
+                    return@loop
                 }
                 is OpDescriptor -> state.perform(this) // help
                 else -> error("Illegal state $state")
@@ -252,8 +261,17 @@ internal class MutexImpl(locked: Boolean) : Mutex, SelectClause2<Any?, Mutex> {
                 is LockedQueue -> {
                     check(state.owner !== owner) { "Already locked by $owner" }
                     val node = LockSelect(owner, select, block)
-                    if (state.addLastIf(node) { _state.value === state }) {
-                        // successfully enqueued
+                    /*
+                     * If the state has been changed while we were adding the waiter,
+                     * it means that 'unlock' has taken it and _either_ resumed it successfully or just overwritten.
+                     * To rendezvous that, we try to "invalidate" our node and go for retry.
+                     *
+                     * Node has to be re-instantiated as we do not support node re-adding, even to
+                     * another list
+                     */
+                    state.addLast(node)
+                    if (_state.value === state || !node.take()) {
+                        // added to waiter list
                         select.disposeOnSelect(node)
                         return
                     }
@@ -300,7 +318,7 @@ internal class MutexImpl(locked: Boolean) : Mutex, SelectClause2<Any?, Mutex> {
                 }
             }
 
-    public override fun unlock(owner: Any?) {
+    override fun unlock(owner: Any?) {
         _state.loop { state ->
             when (state) {
                 is Empty -> {
@@ -319,10 +337,9 @@ internal class MutexImpl(locked: Boolean) : Mutex, SelectClause2<Any?, Mutex> {
                         val op = UnlockOp(state)
                         if (_state.compareAndSet(state, op) && op.perform(this) == null) return
                     } else {
-                        val token = (waiter as LockWaiter).tryResumeLockWaiter()
-                        if (token != null) {
+                        if ((waiter as LockWaiter).tryResumeLockWaiter()) {
                             state.owner = waiter.owner ?: LOCKED
-                            waiter.completeResumeLockWaiter(token)
+                            waiter.completeResumeLockWaiter()
                             return
                         }
                     }
@@ -352,21 +369,28 @@ internal class MutexImpl(locked: Boolean) : Mutex, SelectClause2<Any?, Mutex> {
     private abstract inner class LockWaiter(
         @JvmField val owner: Any?
     ) : LockFreeLinkedListNode(), DisposableHandle {
+        private val isTaken = atomic(false)
+        fun take(): Boolean = isTaken.compareAndSet(false, true)
         final override fun dispose() { remove() }
-        abstract fun tryResumeLockWaiter(): Any?
-        abstract fun completeResumeLockWaiter(token: Any)
+        abstract fun tryResumeLockWaiter(): Boolean
+        abstract fun completeResumeLockWaiter()
     }
 
     private inner class LockCont(
         owner: Any?,
-        @JvmField val cont: CancellableContinuation<Unit>
+        private val cont: CancellableContinuation<Unit>
     ) : LockWaiter(owner) {
-        override fun tryResumeLockWaiter() = cont.tryResume(Unit, idempotent = null) {
-            // if this continuation gets cancelled during dispatch to the caller, then release the lock
-            unlock(owner)
+
+        override fun tryResumeLockWaiter(): Boolean {
+            if (!take()) return false
+            return cont.tryResume(Unit, idempotent = null) {
+                // if this continuation gets cancelled during dispatch to the caller, then release the lock
+                unlock(owner)
+            } != null
         }
-        override fun completeResumeLockWaiter(token: Any) = cont.completeResume(token)
-        override fun toString(): String = "LockCont[$owner, $cont] for ${this@MutexImpl}"
+
+        override fun completeResumeLockWaiter() = cont.completeResume(RESUME_TOKEN)
+        override fun toString(): String = "LockCont[$owner, ${cont}] for ${this@MutexImpl}"
     }
 
     private inner class LockSelect<R>(
@@ -374,9 +398,8 @@ internal class MutexImpl(locked: Boolean) : Mutex, SelectClause2<Any?, Mutex> {
         @JvmField val select: SelectInstance<R>,
         @JvmField val block: suspend (Mutex) -> R
     ) : LockWaiter(owner) {
-        override fun tryResumeLockWaiter(): Any? = if (select.trySelect()) SELECT_SUCCESS else null
-        override fun completeResumeLockWaiter(token: Any) {
-            assert { token === SELECT_SUCCESS }
+        override fun tryResumeLockWaiter(): Boolean = take() && select.trySelect()
+        override fun completeResumeLockWaiter() {
             block.startCoroutineCancellable(receiver = this@MutexImpl, completion = select.completion) {
                 // if this continuation gets cancelled during dispatch to the caller, then release the lock
                 unlock(owner)
