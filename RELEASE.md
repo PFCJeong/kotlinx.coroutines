@@ -21,7 +21,7 @@ To release a new `<version>` of `kotlinx-coroutines`:
      * [`gradle.properties`](gradle.properties)
    * Make sure to **exclude** `CHANGES.md` from replacements.
 
-   As an alternative approach, you can use `./bump-version.sh old_version new_version`
+   As an alternative approach, you can use `./bump-version.sh new_version`
 
 5. Write release notes in [`CHANGES.md`](CHANGES.md):
    * Use the old releases for style guidance.
@@ -43,7 +43,7 @@ To release a new `<version>` of `kotlinx-coroutines`:
    * Get approval for it.
 
 0. On [TeamCity integration server](https://teamcity.jetbrains.com/project.html?projectId=KotlinTools_KotlinxCoroutines):
-   * Wait until "Build" configuration for committed `master` branch passes tests.
+   * Wait until "Build" configuration for committed `version-<version>` branch passes tests.
    * Run "Deploy (Configure, RUN THIS ONE)" configuration with the corresponding new version:
      - Use the `version-<version>` branch
      - Set the `DeployVersion` build parameter to `<version>`
@@ -62,19 +62,19 @@ To release a new `<version>` of `kotlinx-coroutines`:
    * Create a release named `<version>`, creating the `<version>` tag.
    * Cut & paste lines from [`CHANGES.md`](CHANGES.md) into description.
 
-4. Build and publish the documentation for the web-site: <br>
-   `site/deploy.sh <version> push`
+4. Announce the new release in [Slack](https://kotlinlang.slack.com)
 
-5. Announce the new release in [Slack](https://kotlinlang.slack.com)
-
-6. Switch onto the `develop` branch:<br>
+5. Switch onto the `develop` branch:<br>
    `git checkout develop`
 
-7. Fetch the latest `master`:<br>
+6. Fetch the latest `master`:<br>
    `git fetch`
 
-8. Merge the release from `master`:<br>
+7. Merge the release from `master`:<br>
    `git merge origin/master`
 
-9. Push the updates to GitHub:<br>
+8. Push the updates to GitHub:<br>
    `git push`
+
+9. Propose the website documentation update: <br>
+   * Set new value for [`KOTLINX_COROUTINES_RELEASE_TAG`](https://github.com/JetBrains/kotlin-web-site/blob/master/.teamcity/BuildParams.kt), creating a Pull Request in the website's repository. 
