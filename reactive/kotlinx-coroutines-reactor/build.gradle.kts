@@ -33,10 +33,10 @@ val commonKoverExcludes = listOf(
     "kotlinx.coroutines.reactor.ConvertKt\$asFlux$1" // Deprecated
 )
 
-kover {
-    filters {
-        classes {
-            excludes += commonKoverExcludes
-        }
-    }
+tasks.koverHtmlReport {
+    excludes = commonKoverExcludes
+}
+
+tasks.koverVerify {
+    excludes = commonKoverExcludes
 }
