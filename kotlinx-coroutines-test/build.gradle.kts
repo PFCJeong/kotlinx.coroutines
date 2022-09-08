@@ -11,9 +11,3 @@ val experimentalAnnotations = listOf(
 kotlin {
     sourceSets.all { configureMultiplatform() }
 }
-
-tasks.withType<Test> {
-    extensions.configure(kotlinx.kover.api.KoverTaskExtension::class) {
-        isDisabled.set(true)
-    }
-}
