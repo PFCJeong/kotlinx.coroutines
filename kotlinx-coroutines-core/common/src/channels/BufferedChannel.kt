@@ -267,7 +267,7 @@ internal open class BufferedChannel<E>(
         ) -> R = { _, _, _, _ -> error("unexpected") }
     ): R {
         // Read the segment reference before the counter increment;
-        // it is crucial to be able to find a proper one later.
+        // it is crucial to be able to find the required segment later.
         var segment = sendSegment.value
         while (true) {
             // Atomically increment the `senders` counter and obtain the
@@ -465,6 +465,7 @@ internal open class BufferedChannel<E>(
                 state === CHANNEL_CLOSED -> {
                     // Clean the element slot to avoid memory leaks and finish.
                     segment.cleanElement(index)
+                    completeCloseOrCancel()
                     return RESULT_CLOSED
                 }
                 // A waiting receiver is stored in the cell.
@@ -705,10 +706,10 @@ internal open class BufferedChannel<E>(
      * This internal implementation does not invoke [onReceiveSynchronizationCompleted].
      */
     protected fun tryReceiveInternal(): ChannelResult<E> {
-        // Read `receivers` counter first.
+        // Read the `receivers` counter first.
         val r = receivers.value
         val sendersAndCloseStatusCur = sendersAndCloseStatus.value
-        // Is this channel is closed for send?
+        // Is this channel closed for send?
         if (sendersAndCloseStatusCur.isClosedForReceive0) return closed(getCloseCause())
         // Do not try to receive an element if the plain `receive()` operation would suspend.
         val s = sendersAndCloseStatusCur.counter
@@ -716,7 +717,8 @@ internal open class BufferedChannel<E>(
         // Let's try to retrieve an element!
         // The logic is similar to the plain `receive()` operation, with
         // the only difference that we store `INTERRUPTED_RCV` in case
-        // the operation decides to suspend.
+        // the operation decides to suspend. This way, we can leverage
+        // the unconditional `Fetch-and-Add` instruction.
         return receiveImpl( // <-- this is an inline function
             // Store an already interrupted receiver in case of suspension.
             waiter = INTERRUPTED_RCV,
@@ -754,8 +756,8 @@ internal open class BufferedChannel<E>(
         cell specified by the segment and the index in it. */
         onSuspend: (segm: ChannelSegment<E>, i: Int) -> R,
         /* This lambda is called when the channel is observed
-         in the closed state and no waiting senders is found,
-         which means that it is closed for receiving. */
+        in the closed state and no waiting sender is found,
+        which means that it is closed for receiving. */
         onClosed: () -> R,
         /* This lambda is called when the operation decides
         to suspend, but the waiter is not provided (equals `null`).
@@ -767,16 +769,16 @@ internal open class BufferedChannel<E>(
         ) -> R = { _, _, _ -> error("unexpected") }
     ): R {
         // Read the segment reference before the counter increment;
-        // it is crucial to be able to find a proper one later.
+        // it is crucial to be able to find the required segment later.
         var segment = receiveSegment.value
         while (true) {
-            // First, the algorithm checks whether it is eligible
-            // to perform the operation by checking that the channel
-            // is not closed for `receive`, so it neither cancelled nor
-            // closed without having waiting senders or buffered elements.
-            if (sendersAndCloseStatus.value.isClosedForReceive0)
-                return onClosed()
-            // Atomically increment the `receivers` counter
+            // Unlike the `send(e)` operation, `receive()` does not check
+            // whether the channel is closed for receive, performing the
+            // operation optimistically. Instead, if the required segment
+            // is not found, the algorithm performs the check, finishing
+            // immediately if the channel is closed for receiving.
+            //
+            // First, we atomically increment the `receivers` counter
             // and obtain the value before the increment.
             val r = this.receivers.getAndIncrement()
             // Count the required segment id and the cell index in it.
@@ -785,11 +787,13 @@ internal open class BufferedChannel<E>(
             // Try to find the required segment if the initially obtained
             // segment (in the beginning of this function) has lower id.
             if (segment.id != id) {
-                // Find the required segment, restarting the operation
-                // if it has not been found. If the channel is already
-                // closed or cancelled, the operation will detect it
-                // by reading the close status at the beginning.
-                segment = findSegmentReceive(id, segment) ?: continue
+                // Find the required segment, restarting the operation if it
+                // has not been found. If the channel is already cancelled or
+                // closed without stored element, the operation finishes immediately.
+                segment = findSegmentReceive(id, segment) ?:
+                    // The required segment is not found. It is possible that the channel is already
+                    // closed for receiving, so the linked list of segments is closed as well.
+                    if (sendersAndCloseStatus.value.isClosedForReceive0) return onClosed() else continue
             }
             // Update the cell according to the cell life-cycle.
             val updCellResult = updateCellReceive(segment, i, r, waiter)
@@ -1189,6 +1193,139 @@ internal open class BufferedChannel<E>(
         }
     }
 
+    // ######################
+    // ## Iterator Support ##
+    // ######################
+
+    override fun iterator(): ChannelIterator<E> = BufferedChannelIterator()
+
+    /**
+     * The key idea is that an iterator is a special receiver type,
+     * which should be resumed differently to [receive] and [onReceive]
+     * operations, but can be served as a waiter in a way similar to
+     * [CancellableContinuation] and [SelectInstance].
+     *
+     * Roughly, [hasNext] is a [receive] sibling, while [next] simply
+     * returns the already retrieved element. From the implementation
+     * side, [receiveResult] stores the element retrieved by [hasNext]
+     * (or a special [ClosedChannel] token if the channel is closed).
+     *
+     * The [invoke] function is a [CancelHandler] implementation, the
+     * implementation of which requires storing the [segment] and the
+     * [index] in it that specify the location of the stored iterator.
+     *
+     * To resume the suspended [hasNext] call, a special [tryResumeHasNext]
+     * function should be used in a way similar to [CancellableContinuation.tryResume]
+     * and [SelectInstance.trySelect]. When the channel becomes closed,
+     * [tryResumeHasNextWithCloseException] should be used instead.
+     */
+    protected open inner class BufferedChannelIterator : ChannelIterator<E>, BeforeResumeCancelHandler(), Waiter {
+        private var receiveResult: Any? = NO_RECEIVE_RESULT
+
+        private var cont: CancellableContinuation<Boolean>? = null
+
+        private var segment: ChannelSegment<E>? = null
+        private var index = -1
+
+        // on cancellation
+        override fun invoke(cause: Throwable?) {
+            segment?.onCancellation(index)
+            onReceiveDequeued()
+        }
+
+        override suspend fun hasNext(): Boolean = receiveImpl(
+            waiter = null,
+            onElementRetrieved = { element ->
+                this.receiveResult = element
+                onReceiveSynchronizationCompleted()
+                true
+            },
+            onSuspend = { _, _ -> error("unreachable") },
+            onClosed = { onCloseHasNext() },
+            onNoWaiterSuspend = { segm, i, r -> hasNextOnNoWaiterSuspend(segm, i, r) }
+        )
+
+        private fun onCloseHasNext(): Boolean {
+            val cause = getCloseCause()
+            onReceiveSynchronizationCompleted()
+            this.receiveResult = CHANNEL_CLOSED
+            if (cause == null) return false
+            else throw recoverStackTrace(cause)
+        }
+
+        private suspend fun hasNextOnNoWaiterSuspend(
+            segm: ChannelSegment<E>,
+            i: Int,
+            r: Long
+        ): Boolean = suspendCancellableCoroutineReusable { cont ->
+            this.cont = cont
+            receiveImplOnNoWaiter(
+                segm, i, r,
+                waiter = this,
+                onElementRetrieved = { element ->
+                    this.receiveResult = element
+                    this.cont = null
+                    onReceiveSynchronizationCompleted()
+                    cont.resume(true) {
+                        onUndeliveredElement?.callUndeliveredElement(element, cont.context)
+                    }
+                },
+                onSuspend = { segment, i ->
+                    this.segment = segment
+                    this.index = i
+                    cont.invokeOnCancellation(this.asHandler)
+                    onReceiveEnqueued()
+                    onReceiveSynchronizationCompleted()
+                },
+                onClosed = {
+                    this.cont = null
+                    val cause = getCloseCause()
+                    this.receiveResult = CHANNEL_CLOSED
+                    onReceiveSynchronizationCompleted()
+                    if (cause == null) {
+                        cont.resume(false)
+                    } else {
+                        cont.resumeWithException(recoverStackTrace(cause))
+                    }
+                }
+            )
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        override fun next(): E {
+            // Read the already received result, or [NO_RECEIVE_RESULT] if [hasNext] has not been invoked yet.
+            check(receiveResult !== NO_RECEIVE_RESULT) { "`hasNext()` has not been invoked" }
+            val result = receiveResult
+            receiveResult = NO_RECEIVE_RESULT
+            // Is this channel closed?
+            if (result === CHANNEL_CLOSED) throw recoverStackTrace(receiveException)
+            // Return the element.
+            return result as E
+        }
+
+        fun tryResumeHasNext(element: E): Boolean {
+            this.receiveResult = element
+            val cont = this.cont!!
+            this.cont = null
+            return cont.tryResume(true, null, onUndeliveredElement?.bindCancellationFun(element, cont.context)).let {
+                if (it !== null) {
+                    cont.completeResume(it)
+                    true
+                } else false
+            }
+        }
+
+        fun tryResumeHasNextWithCloseException() {
+            this.receiveResult = CHANNEL_CLOSED
+            val cont = cont!!
+            if (getCloseCause() == null) {
+                cont.resume(false)
+            } else {
+                cont.resumeWithException(receiveException)
+            }
+        }
+    }
+
     // ##############################
     // ## Closing and Cancellation ##
     // ##############################
@@ -1253,8 +1390,8 @@ internal open class BufferedChannel<E>(
     }
 
     private fun completeClose(sendersCur: Long) {
-        val segm = closeQueue()
-        removeWaitingRequests(segm, sendersCur)
+        val lastSegment = closeQueue()
+        cancelWaitingReceiveRequests(lastSegment, sendersCur)
         onClosedIdempotent()
     }
 
@@ -1395,7 +1532,7 @@ internal open class BufferedChannel<E>(
         undeliveredElementException?.let { throw it } // throw UndeliveredElementException at the end if there was one
     }
 
-    private fun removeWaitingRequests(lastSegment: ChannelSegment<E>, sendersCur: Long) {
+    private fun cancelWaitingReceiveRequests(lastSegment: ChannelSegment<E>, sendersCur: Long) {
         var segm: ChannelSegment<E>? = lastSegment
         while (segm != null) {
             for (i in SEGMENT_SIZE - 1 downTo 0) {
@@ -1453,144 +1590,6 @@ internal open class BufferedChannel<E>(
             else -> error("Unexpected waiter: $this")
         }
     }
-
-
-    // ######################
-    // ## Iterator Support ##
-    // ######################
-
-    override fun iterator(): ChannelIterator<E> = BufferedChannelIterator()
-
-    /**
-     * The key idea is that an iterator is a special receiver type,
-     * which should be resumed differently to [receive] and [onReceive]
-     * operations, but can be served as a waiter in a way similar to
-     * [CancellableContinuation] and [SelectInstance].
-     *
-     * Roughly, [hasNext] is a [receive] sibling, while [next] simply
-     * returns the already retrieved element. From the implementation
-     * side, [receiveResult] stores the element retrieved by [hasNext]
-     * (or a special [ClosedChannel] token if the channel is closed).
-     *
-     * The [invoke] function is a [CancelHandler] implementation, the
-     * implementation of which requires storing the [segment] and the
-     * [index] in it that specify the location of the stored iterator.
-     *
-     * To resume the suspended [hasNext] call, a special [tryResumeHasNext]
-     * function should be used in a way similar to [CancellableContinuation.tryResume]
-     * and [SelectInstance.trySelect]. When the channel becomes closed,
-     * [tryResumeHasNextWithCloseException] should be used instead.
-     */
-    protected open inner class BufferedChannelIterator : ChannelIterator<E>, BeforeResumeCancelHandler(), Waiter {
-        private var receiveResult: Any? = NO_RECEIVE_RESULT
-
-        private var cont: CancellableContinuation<Boolean>? = null
-
-        private var segment: ChannelSegment<E>? = null
-        private var index = -1
-
-        // on cancellation
-        override fun invoke(cause: Throwable?) {
-            segment?.onCancellation(index)
-            onReceiveDequeued()
-        }
-
-        override suspend fun hasNext(): Boolean = receiveImpl(
-            waiter = null,
-            onElementRetrieved = { element ->
-                this.receiveResult = element
-                onReceiveSynchronizationCompleted()
-                true
-            },
-            onSuspend = { _, _ -> error("unreachable") },
-            onClosed = { onCloseHasNext() },
-            onNoWaiterSuspend = { segm, i, r -> hasNextOnNoWaiterSuspend(segm, i, r) }
-        )
-
-        private fun onCloseHasNext(): Boolean {
-            val cause = getCloseCause()
-            onReceiveSynchronizationCompleted()
-            this.receiveResult = CHANNEL_CLOSED
-            if (cause == null) return false
-            else throw recoverStackTrace(cause)
-        }
-
-        private suspend fun hasNextOnNoWaiterSuspend(
-            segm: ChannelSegment<E>,
-            i: Int,
-            r: Long
-        ): Boolean = suspendCancellableCoroutineReusable { cont ->
-            this.cont = cont
-            receiveImplOnNoWaiter(
-                segm, i, r,
-                waiter = this,
-                onElementRetrieved = { element ->
-                    this.receiveResult = element
-                    this.cont = null
-                    onReceiveSynchronizationCompleted()
-                    cont.resume(true) {
-                        onUndeliveredElement?.callUndeliveredElement(element, cont.context)
-                    }
-                },
-                onSuspend = { segment, i ->
-                    this.segment = segment
-                    this.index = i
-                    cont.invokeOnCancellation(this.asHandler)
-                    onReceiveEnqueued()
-                    onReceiveSynchronizationCompleted()
-                },
-                onClosed = {
-                    this.cont = null
-                    val cause = getCloseCause()
-                    this.receiveResult = CHANNEL_CLOSED
-                    onReceiveSynchronizationCompleted()
-                    if (cause == null) {
-                        cont.resume(false)
-                    } else {
-                        cont.resumeWithException(recoverStackTrace(cause))
-                    }
-                }
-            )
-        }
-
-        @Suppress("UNCHECKED_CAST")
-        override fun next(): E {
-            // Read the already received result, or [NO_RECEIVE_RESULT] if [hasNext] has not been invoked yet.
-            check(receiveResult !== NO_RECEIVE_RESULT) { "`hasNext()` has not been invoked" }
-            val result = receiveResult
-            receiveResult = NO_RECEIVE_RESULT
-            // Is this channel closed?
-            if (result === CHANNEL_CLOSED) throw recoverStackTrace(receiveException)
-            // Return the element.
-            return result as E
-        }
-
-        fun tryResumeHasNext(element: E): Boolean {
-            this.receiveResult = element
-            val cont = this.cont!!
-            this.cont = null
-            return cont.tryResume(true, null, onUndeliveredElement?.bindCancellationFun(element, cont.context)).let {
-                if (it !== null) {
-                    cont.completeResume(it)
-                    true
-                } else false
-            }
-        }
-
-        fun tryResumeHasNextWithCloseException() {
-            this.receiveResult = CHANNEL_CLOSED
-            val cont = cont!!
-            if (getCloseCause() == null) {
-                cont.resume(false)
-            } else {
-                cont.resumeWithException(receiveException)
-            }
-        }
-    }
-
-    // #################################################
-    // # isClosedFor[Send,Receive] and isEmpty SUPPORT #
-    // #################################################
 
     @ExperimentalCoroutinesApi
     override val isClosedForSend: Boolean
@@ -1723,7 +1722,7 @@ internal open class BufferedChannel<E>(
     }
 
     // #######################
-    // # SEGMENTS MANAGEMENT #
+    // # Segments Management #
     // #######################
 
     private fun findSegmentSend(id: Long, start: ChannelSegment<E>) =
@@ -1860,11 +1859,12 @@ internal open class BufferedChannel<E>(
                     else -> error("Unexpected segment cell state: $state")
                 }
             }
-//            if (interruptedOrClosed == SEGMENT_SIZE) {
-//                check(segment === receiveSegment.value || segment === sendSegment.value || segment === bufferEndSegment.value) {
-//                    "logically removed segment is accessible" // TODO
-//                }
-//            }
+            // TODO: add the check below
+            //if (interruptedOrClosed == SEGMENT_SIZE) {
+            //    check(segment === receiveSegment.value || segment === sendSegment.value || segment === bufferEndSegment.value) {
+            //        "logically removed segment is reachable"
+            //    }
+            //}
             segment = segment.next!!
         }
     }
@@ -1957,7 +1957,7 @@ internal class ChannelSegment<E>(id: Long, prev: ChannelSegment<E>?, pointers: I
             if (data[index * 2 + 1].compareAndSet(cur, update)) break
         }
         // Clean the element slot.
-        cleanElement(index)
+        if (update === INTERRUPTED_SEND || update === INTERRUPTED_RCV) cleanElement(index)
         // Inform the segment that one more slot has been cleaned.
         // TODO: The current implementation allows only full-of-cancelled-senders segments
         // TODO: to be physically removed. Obviously, it causes a memory leak, and we do
